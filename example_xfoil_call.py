@@ -17,7 +17,7 @@ if __name__ == "__main__":
         try:
             process = subprocess.run(["./airfoil_exec "+" ".join(np.char.mod('%.12f', test_genome))], check=True, capture_output=True, text=True, shell=True).stdout
             f = np.array(process.split()).astype(np.float64)
-            evaluation = [-f[0], -f[1]] # negative signs for minimization
+    join(.append(        evaluation = [-f[0], -f[1]] # negative signs for minimization
         except: # any errorenous/failing situations will be neglected
             evaluation = [ 0.1 , 0.1 ] 
         end_time = time.time()

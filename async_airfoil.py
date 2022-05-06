@@ -1,8 +1,8 @@
 import sys
 # e.g. mpirun -np 32 python ~.py
-NUM_PROCESSES = int(sys.argv[1])  # num of processors
-NUM_POP       = int(sys.argv[2]) # size of population
-NUM_GEN       = int(sys.argv[3])  # num of generations ! in async, it determines # of total birth as num_gen * num_pop
+# NUM_PROCESSES = int(sys.argv[1])  # num of processors
+NUM_POP       = int(sys.argv[1]) # size of population
+NUM_GEN       = int(sys.argv[2])  # num of generations ! in async, it determines # of total birth as num_gen * num_pop
 
 import numpy as np
 import distributed
@@ -10,8 +10,10 @@ import abc, itertools
 import uuid, time, os, platform
 import matplotlib.pyplot as plt
 
+import dask
 from dask_mpi import initialize
-from dask.distributed import Client, LocalCluster
+from dask.distributed import Client, LocalCluster, performance_report
+from mpi4py import MPI
 
 from pymoo.core.repair import NoRepair
 from pymoo.core.mating import Mating
@@ -27,6 +29,7 @@ from pymoo.factory import get_problem
 from pymoo.algorithms.moo.nsga2 import NSGA2, RankAndCrowdingSurvival, calc_crowding_distance, binary_tournament
 
 import subprocess
+import jupyter_server_proxy
 
 class Decoder(abc.ABC):
     @abc.abstractmethod
@@ -152,151 +155,157 @@ def evaluate(individual):
     return individual
         
 if __name__ == "__main__":
-    initialize()
-    cluster = LocalCluster(dashboard_address=None, threads_per_worker=1)
-    cluster.scale(NUM_PROCESSES)
-    client = Client(cluster)
-    print("STARTED. Async, Proc",f'{NUM_PROCESSES:03d}'," Popu ",f'{NUM_POP:06d}'," Gens ",f'{NUM_GEN:03d}')
+    dask.config.config["distributed"]["dashboard"]["link"] = "{JUPYTERHUB_SERVICE_PREFIX}proxy/{host}:{port}/status"
+    initialize(nthreads=1)
+    # cluster = LocalCluster(threads_per_worker=1)
+    # cluster.scale(NUM_PROCESSES)
+    client = Client()
+
+    # Wait for stabilization... not sure it's necessary though
+    print("WAIT FOR 5 SECONDS...")
+    time.sleep(5)
+
+    print(client)
+    print("STARTED. Async") # , Proc",f'{MPI.COMM_WORLD.Get_size()-2:03d}'," Popu ",f'{NUM_POP:06d}'," Gens ",f'{NUM_GEN:03d}
 
     pop_size = NUM_POP
     birth_limit = NUM_GEN*NUM_POP # similar to gen_limit
 
-    # # Wait for stabilization... not sure it's necessary though
-    # print("WAIT FOR 5 SECONDS...")
-    # time.sleep(5)
     # print("GA INITIALIZED")
 
     t_start = time.time()
+    with performance_report(filename='report_proc'+f'{MPI.COMM_WORLD.Get_size()-2:03d}'+'_pop'+f'{NUM_POP:03d}'+'_gen'+f'{NUM_GEN:03d}'+'_async.html'):
+        # Asynchronous population initialization
+        init_pop = np.ceil(pop_size*2.).astype('int')
+        parents = DistributedIndividual.create_population(init_pop, initialize=create_rand_sequence(25, xl=-1, xu=1), decoder=IdentityDecoder())
 
-    # Asynchronous population initialization
-    init_pop = np.ceil(pop_size*2.).astype('int')
-    parents = DistributedIndividual.create_population(init_pop, initialize=create_rand_sequence(25, xl=-1, xu=1), decoder=IdentityDecoder())
-    
-    # Population guess
-    dat = np.genfromtxt("init.csv",delimiter=',')
-    for i in range(len(parents)):
-        parents[i].genome = dat[i]
+        # Population guess
+        dat = np.genfromtxt("init.csv",delimiter=',')
+        for i in range(len(parents)):
+            parents[i].genome = dat[i]
 
-    worker_futures = client.map(evaluate, parents, pure=False)
-    as_completed_iter = distributed.as_completed(worker_futures)
-    pop_bag = []
+        worker_futures = client.map(evaluate, parents, pure=False)
+        as_completed_iter = distributed.as_completed(worker_futures)
+        pop_bag = []
 
-    num_offspring = 0 # initialize
+        num_offspring = 0 # initialize
 
-    # # Wait for stabilization... not sure it's necessary though
-    # print("WAIT FOR 5 MORE SECONDS...")
-    # time.sleep(5)
+        # # Wait for stabilization... not sure it's necessary though
+        # print("WAIT FOR 5 MORE SECONDS...")
+        # time.sleep(5)
 
-    # print("GA STARTS")
+        # print("GA STARTS")
+        # t_start = time.time()
 
-    mating = Mating(selection=TournamentSelection(func_comp=binary_tournament),
-                crossover=SimulatedBinaryCrossover(eta=15, prob=0.9),
-                mutation=PolynomialMutation(prob=None, eta=20),
-                repair=NoRepair(),
-                eliminate_duplicates=DefaultDuplicateElimination(),
-                n_max_iterations=100)
-    
-    # Main GA solver
-    for i, evaluated_future in enumerate(as_completed_iter):
-        if i == birth_limit:
-            break
-        evaluated = evaluated_future.result()
-        # print(i+1, ', evaluated: ', evaluated.genome, evaluated.fitness)
-        print(f'{i+1:06d}',
-              ', worker: ',f'{evaluated.pid:06d}',
-              ', evaluated: ', f'{evaluated.fitness[0]:12.4e}',', ',f'{evaluated.fitness[1]:12.4e}',
-              ', end: ',f'{evaluated.stop_eval_time-t_start:.4f}', ' , start: ',f'{evaluated.start_eval_time-t_start:.4f}')
 
-        pop_bag.append(evaluated)
+        mating = Mating(selection=TournamentSelection(func_comp=binary_tournament),
+                    crossover=SimulatedBinaryCrossover(eta=15, prob=0.9),
+                    mutation=PolynomialMutation(prob=None, eta=20),
+                    repair=NoRepair(),
+                    eliminate_duplicates=DefaultDuplicateElimination(),
+                    n_max_iterations=100)
 
-        P = np.array([pop.genome for pop in pop_bag])
-        F = np.array([pop.fitness for pop in pop_bag])
-        Popu = Population.create(P)
-        for j in range(np.shape(F)[0]):
-            Popu[j].F = F[j]
-            Popu[j].CV = np.zeros(1)
-            
-        if len(pop_bag) > pop_size:
-            survival = RankAndCrowdingSurvival()
-            Popu = survival.do(problem=Problem(), pop=Popu, n_survive=pop_size)
-            survival = RankAndCrowdingSurvivalMod()
-            pop_bag  = survival._do(pops=pop_bag, n_survive=pop_size)
+        # Main GA solver
+        for i, evaluated_future in enumerate(as_completed_iter):
+            if i == birth_limit:
+                break
+            evaluated = evaluated_future.result()
+            # print(i+1, ', evaluated: ', evaluated.genome, evaluated.fitness)
+            print(f'{i+1:06d}',
+                  ', worker: ',f'{evaluated.pid:06d}',
+                  ', evaluated: ', f'{evaluated.fitness[0]:12.4e}',', ',f'{evaluated.fitness[1]:12.4e}',
+                  ', end: ',f'{evaluated.stop_eval_time-t_start:.4f}', ' , start: ',f'{evaluated.start_eval_time-t_start:.4f}')
 
-            if num_offspring < birth_limit: 
-                mating = Mating(selection=TournamentSelection(func_comp=binary_tournament),
-                                crossover=SimulatedBinaryCrossover(eta=15, prob=0.9),
-                                mutation=PolynomialMutation(prob=None, eta=20),
-                                repair=NoRepair(),
-                                eliminate_duplicates=DefaultDuplicateElimination(),
-                                n_max_iterations=100)
-                off = mating.do(problem=Problem(n_var=np.shape(Popu[0].X)[0], xl=0., xu=1.), pop=Popu, n_offsprings=1, algorithm=NSGA2())
-                offspring = DistributedIndividual.create_population(1, initialize=create_rand_sequence(25, xl=0, xu=1), decoder=IdentityDecoder())
-                offspring[0].genome=off.get("X").reshape((25,))
+            pop_bag.append(evaluated)
 
-                as_completed_iter.add(client.submit(evaluate, offspring[0]))
+            P = np.array([pop.genome for pop in pop_bag])
+            F = np.array([pop.fitness for pop in pop_bag])
+            Popu = Population.create(P)
+            for j in range(np.shape(F)[0]):
+                Popu[j].F = F[j]
+                Popu[j].CV = np.zeros(1)
 
-        # Save pseudo-generational data
-        if (i+1) % pop_size == 0:
-            # print(f'{int((i+1)/pop_size):05d}')
-            np.savetxt(fname='./GAdata/Async_Airf_Gen_'+f'{int((i+1)/pop_size):05d}'+'_Population.csv', delimiter=",", X=Popu.get("X"))
-            np.savetxt(fname='./GAdata/Async_Airf_Gen_'+f'{int((i+1)/pop_size):05d}'+'_Score.csv', delimiter=",", X=Popu.get("F"))
-                
-        num_offspring += 1
+            if len(pop_bag) > pop_size:
+                survival = RankAndCrowdingSurvival()
+                Popu = survival.do(problem=Problem(), pop=Popu, n_survive=pop_size)
+                survival = RankAndCrowdingSurvivalMod()
+                pop_bag  = survival._do(pops=pop_bag, n_survive=pop_size)
 
-#         if (i+1) == pop_size:
-#             survival = RankAndCrowdingSurvival()
-#             Popu = survival.do(problem=Problem(), pop=Popu, n_survive=pop_size)
-#             for p in Popu:
-#                 p.CV = np.zeros(1)
-#             off = mating.do(problem=Problem(n_var=np.shape(Popu[0].X)[0], xl=-1., xu=1.), pop=Popu, n_offsprings=pop_size, algorithm=NSGA2())
-#             offspring = DistributedIndividual.create_population(pop_size, initialize=create_rand_sequence(25, xl=-1, xu=1), decoder=IdentityDecoder())
-#             for k in range(pop_size):
-#                 offspring[k].genome = off.get("X").reshape((25,len(offspring)))[:,k]
-#                 as_completed_iter.add(client.submit(evaluate, offspring[k]))
+                if num_offspring < birth_limit: 
+                    mating = Mating(selection=TournamentSelection(func_comp=binary_tournament),
+                                    crossover=SimulatedBinaryCrossover(eta=15, prob=0.9),
+                                    mutation=PolynomialMutation(prob=None, eta=20),
+                                    repair=NoRepair(),
+                                    eliminate_duplicates=DefaultDuplicateElimination(),
+                                    n_max_iterations=100)
+                    off = mating.do(problem=Problem(n_var=np.shape(Popu[0].X)[0], xl=0., xu=1.), pop=Popu, n_offsprings=1, algorithm=NSGA2())
+                    offspring = DistributedIndividual.create_population(1, initialize=create_rand_sequence(25, xl=0, xu=1), decoder=IdentityDecoder())
+                    offspring[0].genome=off.get("X").reshape((25,))
 
-#         if len(pop_bag) >= 2*pop_size:
-#             survival = RankAndCrowdingSurvival()
-#             Popu = survival.do(problem=Problem(), pop=Popu, n_survive=pop_size)
-#             for p in Popu:
-#                 p.CV = np.zeros(1)
-#             survival = RankAndCrowdingSurvivalMod()
-#             pop_bag  = survival._do(pops=pop_bag, n_survive=pop_size)
+                    as_completed_iter.add(client.submit(evaluate, offspring[0]))
 
-#             off = mating.do(problem=Problem(n_var=np.shape(Popu[0].X)[0], xl=-1., xu=1.), pop=Popu, n_offsprings=pop_size, algorithm=NSGA2())
-#             offspring = DistributedIndividual.create_population(pop_size, initialize=create_rand_sequence(25, xl=-1, xu=1), decoder=IdentityDecoder())
-#             for k in range(pop_size):
-#                 offspring[k].genome = off.get("X").reshape((25,len(offspring)))[:,k]
-#                 as_completed_iter.add(client.submit(evaluate, offspring[k]))
-#             # offspring[0].genome=off.get("X").reshape((25,))
+            # Save pseudo-generational data
+            if (i+1) % pop_size == 0:
+                # print(f'{int((i+1)/pop_size):05d}')
+                np.savetxt(fname='./GAdata/Async_Airf_Gen_'+f'{int((i+1)/pop_size):05d}'+'_Population.csv', delimiter=",", X=Popu.get("X"))
+                np.savetxt(fname='./GAdata/Async_Airf_Gen_'+f'{int((i+1)/pop_size):05d}'+'_Score.csv', delimiter=",", X=Popu.get("F"))
 
-#             # as_completed_iter.add(client.submit(evaluate, offspring[0]))
+            num_offspring += 1
 
-#             num_offspring += pop_size
+    #         if (i+1) == pop_size:
+    #             survival = RankAndCrowdingSurvival()
+    #             Popu = survival.do(problem=Problem(), pop=Popu, n_survive=pop_size)
+    #             for p in Popu:
+    #                 p.CV = np.zeros(1)
+    #             off = mating.do(problem=Problem(n_var=np.shape(Popu[0].X)[0], xl=-1., xu=1.), pop=Popu, n_offsprings=pop_size, algorithm=NSGA2())
+    #             offspring = DistributedIndividual.create_population(pop_size, initialize=create_rand_sequence(25, xl=-1, xu=1), decoder=IdentityDecoder())
+    #             for k in range(pop_size):
+    #                 offspring[k].genome = off.get("X").reshape((25,len(offspring)))[:,k]
+    #                 as_completed_iter.add(client.submit(evaluate, offspring[k]))
 
-    t_end = time.time()
-    print('DASK:',t_end-t_start)
-    
-#     # X: genome, F: fitness
-#     X = Popu.get("X")
-#     F = Popu.get("F")
-    
-#     # Design space plot
-#     xl, xu = 0, 1
-#     plt.figure(figsize=(7, 5))
-#     plt.scatter(X[:, 0], X[:, 1], s=30, facecolors='none', edgecolors='r')
-#     plt.xlim(xl, xu)
-#     plt.ylim(xl, xu)
-#     plt.title("Design Space")
-#     plt.show()
+    #         if len(pop_bag) >= 2*pop_size:
+    #             survival = RankAndCrowdingSurvival()
+    #             Popu = survival.do(problem=Problem(), pop=Popu, n_survive=pop_size)
+    #             for p in Popu:
+    #                 p.CV = np.zeros(1)
+    #             survival = RankAndCrowdingSurvivalMod()
+    #             pop_bag  = survival._do(pops=pop_bag, n_survive=pop_size)
 
-#     # Objective space plot
-#     plt.figure(figsize=(7, 5))
-#     plt.scatter(F[:, 0], F[:, 1], s=30, facecolors='none', edgecolors='blue', label="Solutions")
-#     plt.title("Objective Space (ZDT3)")
-#     pf = get_problem("zdt3").pareto_front(use_cache=False, flatten=True)
-#     plt.plot(pf[:, 0], pf[:, 1], alpha=0.5, marker="o", linewidth=0, color="red", label="Pareto-front")
-#     plt.legend()
-#     plt.show()
+    #             off = mating.do(problem=Problem(n_var=np.shape(Popu[0].X)[0], xl=-1., xu=1.), pop=Popu, n_offsprings=pop_size, algorithm=NSGA2())
+    #             offspring = DistributedIndividual.create_population(pop_size, initialize=create_rand_sequence(25, xl=-1, xu=1), decoder=IdentityDecoder())
+    #             for k in range(pop_size):
+    #                 offspring[k].genome = off.get("X").reshape((25,len(offspring)))[:,k]
+    #                 as_completed_iter.add(client.submit(evaluate, offspring[k]))
+    #             # offspring[0].genome=off.get("X").reshape((25,))
+
+    #             # as_completed_iter.add(client.submit(evaluate, offspring[0]))
+
+    #             num_offspring += pop_size
+
+        t_end = time.time()
+        print('DASK:',t_end-t_start)
+
+    #     # X: genome, F: fitness
+    #     X = Popu.get("X")
+    #     F = Popu.get("F")
+
+    #     # Design space plot
+    #     xl, xu = 0, 1
+    #     plt.figure(figsize=(7, 5))
+    #     plt.scatter(X[:, 0], X[:, 1], s=30, facecolors='none', edgecolors='r')
+    #     plt.xlim(xl, xu)
+    #     plt.ylim(xl, xu)
+    #     plt.title("Design Space")
+    #     plt.show()
+
+    #     # Objective space plot
+    #     plt.figure(figsize=(7, 5))
+    #     plt.scatter(F[:, 0], F[:, 1], s=30, facecolors='none', edgecolors='blue', label="Solutions")
+    #     plt.title("Objective Space (ZDT3)")
+    #     pf = get_problem("zdt3").pareto_front(use_cache=False, flatten=True)
+    #     plt.plot(pf[:, 0], pf[:, 1], alpha=0.5, marker="o", linewidth=0, color="red", label="Pareto-front")
+    #     plt.legend()
+    #     plt.show()
     
     # Close the DASK client
     as_completed_iter.clear()

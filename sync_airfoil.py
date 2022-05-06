@@ -1,8 +1,8 @@
 import sys
 # e.g. mpirun -np 32 python ~.py
-NUM_PROCESSES = int(sys.argv[1])  # num of processors
-NUM_POP       = int(sys.argv[2])  # size of population
-NUM_GEN       = int(sys.argv[3])  # num of generations ! in async, it determines # of total birth as num_gen * num_pop
+# NUM_PROCESSES = int(sys.argv[1])  # num of processors
+NUM_POP       = int(sys.argv[1])  # size of population
+NUM_GEN       = int(sys.argv[2])  # num of generations ! in async, it determines # of total birth as num_gen * num_pop
 
 #    This file is part of DEAP.
 #
@@ -27,9 +27,11 @@ import time, os
 
 import numpy
 
+import dask
 from dask_mpi import initialize
-from dask.distributed import Client, LocalCluster
+from dask.distributed import Client, LocalCluster, performance_report
 import dask.bag as db
+from mpi4py import MPI
 # import multiprocessing
 
 from math import sqrt
@@ -40,6 +42,8 @@ from deap import benchmarks
 from deap.benchmarks.tools import diversity, convergence, hypervolume
 from deap import creator
 from deap import tools
+
+import jupyter_server_proxy
 
 def dask_map(func, iterable):
     bag = db.from_sequence(iterable).map(func)
@@ -94,7 +98,7 @@ def evaluate(ind):
     
     print('worker: ',f'{os.getpid():06d}',
           ', evaluated: ', f'{fitness[0]:12.4e}',', ',f'{fitness[1]:12.4e}',
-          ', end: ',f'{et-t_start:.4f}', ' , start: ',f'{st-t_start:.4f}')
+          ', end: ',f'{et-start:.4f}', ' , start: ',f'{st-start:.4f}')
 #     print("evaluated on " + multiprocessing.current_process().name + ": ",fitness)
         
     return fitness
@@ -188,11 +192,17 @@ def main(seed=None):
     return pop, logbook
 
 if __name__ == "__main__":
-    initialize()
-    cluster = LocalCluster(dashboard_address=None, threads_per_worker=1)
-    cluster.scale(NUM_PROCESSES)
-    client = Client(cluster)
-    print("STARTED. Sync, Proc",f'{NUM_PROCESSES:03d}'," Popu ",f'{NUM_POP:06d}'," Gens ",f'{NUM_GEN:03d}')
+    dask.config.config["distributed"]["dashboard"]["link"] = "{JUPYTERHUB_SERVICE_PREFIX}proxy/{host}:{port}/status"
+    initialize(nthreads=1)
+    # cluster = LocalCluster(dashboard_address=":0", threads_per_worker=1)
+    # cluster.scale(NUM_PROCESSES)
+    client = Client()
+    
+    # Wait for stabilization... not sure it's necessary though
+    print("WAIT FOR 5 SECONDS...")
+    time.sleep(5)
+    print(client)
+    print("STARTED. Sync") # , Proc",f'{MPI.COMM_WORLD.Get_size()-2:03d}'," Popu ",f'{NUM_POP:06d}'," Gens ",f'{NUM_GEN:03d}
 
     # with open("pareto_front/zdt1_front.json") as optimal_front_data:
     #     optimal_front = json.load(optimal_front_data)
@@ -200,8 +210,8 @@ if __name__ == "__main__":
     # optimal_front = sorted(optimal_front[i] for i in range(0, len(optimal_front), 2))
     
     start = time.time()
-
-    pop, stats = main()
+    with performance_report(filename='report_proc'+f'{MPI.COMM_WORLD.Get_size()-2:03d}'+'_pop'+f'{NUM_POP:03d}'+'_gen'+f'{NUM_GEN:03d}'+'_sync.html'):
+        pop, stats = main()
 
     end = time.time()
     print(end - start)
@@ -221,3 +231,6 @@ if __name__ == "__main__":
     # plt.scatter(front[:,0], front[:,1], c="b")
     # plt.axis("tight")
     # plt.show()
+
+    # Close the DASK client
+    client.close()
